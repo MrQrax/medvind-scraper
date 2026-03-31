@@ -88,6 +88,9 @@ async def scrape_shifts(page: Page) -> list[dict]:
         shift["absent"] = [
             _format_person(p) for p in people if p["status"] == "absent"
         ]
+        shift["kan_arbeta"] = [
+            p["name"] for p in people if p["status"] == "kan_arbeta"
+        ]
 
     # Steg 3: Hämta dagpersonal som slutar ~21 för rapport
     await _scrape_rapport(page, shifts)
@@ -261,7 +264,11 @@ def _classify_cell(text: str, colors: set[str]) -> tuple[str, str]:
     if annotation == "Täckare":
         return "working", "Kaninholmen & Kiaholmen"
 
-    # 5. Allt annat = jobbar normalt (Rådmansholmen)
+    # 5. Ka = Kan arbeta (tillgänglig, inte schemalagd)
+    if type_code == "Ka":
+        return "kan_arbeta", ""
+
+    # 6. Allt annat = jobbar normalt (Rådmansholmen)
     note = annotation if annotation else ""
     return "working", note
 
@@ -361,7 +368,9 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
                 "coworkers": [],
                 "covering": [],
                 "absent": [],
+                "kan_arbeta": [],
                 "rapport_from": [],
+                "rapport_to": [],
                 "raw_text": f"{header} {time_text} {shift_type}".strip(),
                 "scraped_at": datetime.now().isoformat(),
             })
@@ -374,19 +383,27 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
     return shifts
 
 
-# ── Rapport-scraping (dagpersonal som slutar ~21:00) ─────────────────
+# ── Rapport-scraping (kväll ~21:00 + morgon ~07:00) ──────────────────
 
 async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
-    """Hämta dagpersonal som slutar ~21:00 för rapport/överlämning.
+    """Hämta dagpersonal för rapport: kväll (slutar ~21) och morgon (börjar ~07).
 
-    Navigerar via Välj organisation till rätt avdelning (dag-vy)
-    och hittar vem som slutar runt 21:00 de dagar användaren jobbar natt.
+    Navigerar via Välj organisation till rätt avdelning och extraherar:
+    - rapport_from: vem som slutar ~21:00 samma kväll (lämnar rapport till dig)
+    - rapport_to: vem som börjar ~07:00 morgonen efter (du lämnar rapport till)
     """
-    # Avdelnings-sökord → trädnod-text i Medvind
+    from datetime import timedelta
+
     DEPT_KEYWORDS = {
         "Rådmansholmen": "dmansholmen",
         "Kaninholmen & Kiaholmen": ["Kaninholmen", "Kiaholmen"],
     }
+
+    # Beräkna morgondatum per pass (nattpass 20:45→07:15 = nästa dag)
+    next_day_map = {}
+    for shift in shifts:
+        d = datetime.strptime(shift["date"], "%Y-%m-%d")
+        next_day_map[shift["date"]] = (d + timedelta(days=1)).strftime("%Y-%m-%d")
 
     locations_needed = set()
     for shift in shifts:
@@ -399,13 +416,20 @@ async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
                 keywords = [keywords]
 
             for keyword in keywords:
-                rapport_map = await _select_dept_and_extract(page, keyword)
-                if rapport_map:
-                    for shift in shifts:
-                        if shift.get("location") == location:
-                            existing = shift.get("rapport_from", [])
-                            new = rapport_map.get(shift["date"], [])
-                            shift["rapport_from"] = existing + new
+                evening_map, morning_map = await _select_dept_and_extract(page, keyword)
+
+                for shift in shifts:
+                    if shift.get("location") != location:
+                        continue
+
+                    # Kväll: slutar ~21:00 samma dag
+                    new_from = evening_map.get(shift["date"], [])
+                    shift["rapport_from"] = shift.get("rapport_from", []) + new_from
+
+                    # Morgon: börjar ~07:00 dagen efter
+                    morning_date = next_day_map[shift["date"]]
+                    new_to = morning_map.get(morning_date, [])
+                    shift["rapport_to"] = shift.get("rapport_to", []) + new_to
 
         # Byt tillbaka till Natt-vyn
         await _select_dept_via_org(page, "Natt")
@@ -415,6 +439,7 @@ async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
 
     for shift in shifts:
         shift.setdefault("rapport_from", [])
+        shift.setdefault("rapport_to", [])
 
 
 async def _select_dept_via_org(page: Page, keyword: str) -> bool:
@@ -471,18 +496,23 @@ async def _select_dept_via_org(page: Page, keyword: str) -> bool:
         return False
 
 
-async def _select_dept_and_extract(page: Page, keyword: str) -> dict[str, list[str]]:
-    """Välj avdelning via organisation och extrahera dagpersonal som slutar ~21."""
+async def _select_dept_and_extract(
+    page: Page, keyword: str
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Välj avdelning och extrahera kväll- och morgonpersonal."""
     if not await _select_dept_via_org(page, keyword):
-        return {}
+        return {}, {}
 
-    rapport_map = await _extract_dag_workers(page)
-    logger.info("Rapport %s: %s", keyword, rapport_map)
-    return rapport_map
+    evening_map, morning_map = await _extract_dag_workers(page)
+    logger.info("Rapport %s — kväll: %d dagar, morgon: %d dagar",
+                keyword, len(evening_map), len(morning_map))
+    return evening_map, morning_map
 
 
-async def _extract_dag_workers(page: Page) -> dict[str, list[str]]:
-    """Extrahera dagpersonal som slutar runt 21:00 från aktuell Översikt-vy."""
+async def _extract_dag_workers(
+    page: Page,
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Extrahera dagpersonal: slutar ~21:00 (kväll) och börjar ~07:00 (morgon)."""
     year = datetime.now().year
     try:
         period_text = await page.locator("text=/\\d{4}-\\d{2}-\\d{2}/").first.inner_text(timeout=3000)
@@ -527,10 +557,11 @@ async def _extract_dag_workers(page: Page) -> dict[str, list[str]]:
 
     if not raw or not raw.get("rows"):
         logger.warning("Kunde inte extrahera dagpersonal")
-        return {}
+        return {}, {}
 
     headers = raw["headers"]
-    result: dict[str, list[str]] = {}
+    evening: dict[str, list[str]] = {}  # Slutar ~21:00
+    morning: dict[str, list[str]] = {}  # Börjar ~07:00
 
     for row in raw["rows"]:
         name = row["name"]
@@ -544,25 +575,28 @@ async def _extract_dag_workers(page: Page) -> dict[str, list[str]]:
             if not text or text == "Ledig":
                 continue
 
-            # Hitta sluttid — matcha "HH:MM-HH:MM" och kolla sluttiden
-            end_match = re.search(r'\d{1,2}:\d{2}\s*[-–]\s*(\d{1,2}):(\d{2})', text)
-            if not end_match:
-                continue
-
-            end_hour = int(end_match.group(1))
-            end_min = int(end_match.group(2))
-
-            # Acceptera pass som slutar 20:30–21:30
-            total_min = end_hour * 60 + end_min
-            if not (20 * 60 + 30 <= total_min <= 21 * 60 + 30):
-                continue
-
             date_str = _header_to_date(headers[col_idx], year)
-            if date_str:
-                result.setdefault(date_str, []).append(name)
+            if not date_str:
+                continue
 
-    logger.info("Dagpersonal som slutar ~21: %d dagar", len(result))
-    return result
+            # Matcha alla tidsintervall i cellen (kan ha flera pass)
+            for m in re.finditer(r'(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})', text):
+                start_h, start_m = int(m.group(1)), int(m.group(2))
+                end_h, end_m = int(m.group(3)), int(m.group(4))
+
+                start_total = start_h * 60 + start_m
+                end_total = end_h * 60 + end_m
+
+                # Kväll: slutar exakt 21:00
+                if end_h == 21 and end_m == 0:
+                    evening.setdefault(date_str, []).append(name)
+
+                # Morgon: börjar exakt 07:00
+                if start_h == 7 and start_m == 0:
+                    morning.setdefault(date_str, []).append(name)
+
+    logger.info("Kväll ~21: %d dagar, Morgon ~07: %d dagar", len(evening), len(morning))
+    return evening, morning
 
 
 def _save_shifts(shifts: list[dict]):
