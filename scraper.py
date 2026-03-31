@@ -416,20 +416,24 @@ async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
                 keywords = [keywords]
 
             for keyword in keywords:
-                evening_map, morning_map = await _select_dept_and_extract(page, keyword)
+                evening_map, morning_map, ka_map = await _select_dept_and_extract(page, keyword)
 
                 for shift in shifts:
                     if shift.get("location") != location:
                         continue
 
-                    # Kväll: slutar ~21:00 samma dag
+                    # Kväll: slutar 21:00 samma dag
                     new_from = evening_map.get(shift["date"], [])
                     shift["rapport_from"] = shift.get("rapport_from", []) + new_from
 
-                    # Morgon: börjar ~07:00 dagen efter
+                    # Morgon: börjar 07:00 dagen efter
                     morning_date = next_day_map[shift["date"]]
                     new_to = morning_map.get(morning_date, [])
                     shift["rapport_to"] = shift.get("rapport_to", []) + new_to
+
+                    # Kan arbeta på avdelningen samma dag
+                    new_ka = ka_map.get(shift["date"], [])
+                    shift["kan_arbeta"] = shift.get("kan_arbeta", []) + new_ka
 
         # Byt tillbaka till Natt-vyn
         await _select_dept_via_org(page, "Natt")
@@ -498,15 +502,15 @@ async def _select_dept_via_org(page: Page, keyword: str) -> bool:
 
 async def _select_dept_and_extract(
     page: Page, keyword: str
-) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Välj avdelning och extrahera kväll- och morgonpersonal."""
+) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    """Välj avdelning och extrahera kväll-, morgon- och Ka-personal."""
     if not await _select_dept_via_org(page, keyword):
-        return {}, {}
+        return {}, {}, {}
 
-    evening_map, morning_map = await _extract_dag_workers(page)
-    logger.info("Rapport %s — kväll: %d dagar, morgon: %d dagar",
-                keyword, len(evening_map), len(morning_map))
-    return evening_map, morning_map
+    evening_map, morning_map, ka_map = await _extract_dag_workers(page)
+    logger.info("Rapport %s — kväll: %d, morgon: %d, ka: %d dagar",
+                keyword, len(evening_map), len(morning_map), len(ka_map))
+    return evening_map, morning_map, ka_map
 
 
 async def _extract_dag_workers(
@@ -560,8 +564,9 @@ async def _extract_dag_workers(
         return {}, {}
 
     headers = raw["headers"]
-    evening: dict[str, list[str]] = {}  # Slutar ~21:00
-    morning: dict[str, list[str]] = {}  # Börjar ~07:00
+    evening: dict[str, list[str]] = {}   # Slutar 21:00
+    morning: dict[str, list[str]] = {}   # Börjar 07:00
+    kan_arbeta: dict[str, list[str]] = {}  # Ka (kan jobba)
 
     for row in raw["rows"]:
         name = row["name"]
@@ -579,13 +584,15 @@ async def _extract_dag_workers(
             if not date_str:
                 continue
 
-            # Matcha alla tidsintervall i cellen (kan ha flera pass)
+            # Ka (Kan arbeta) — samla separat
+            if re.search(r"\d[:]\d{2}Ka", text):
+                kan_arbeta.setdefault(date_str, []).append(name)
+                continue
+
+            # Matcha alla tidsintervall i cellen
             for m in re.finditer(r'(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})', text):
                 start_h, start_m = int(m.group(1)), int(m.group(2))
                 end_h, end_m = int(m.group(3)), int(m.group(4))
-
-                start_total = start_h * 60 + start_m
-                end_total = end_h * 60 + end_m
 
                 # Kväll: slutar exakt 21:00
                 if end_h == 21 and end_m == 0:
@@ -595,8 +602,8 @@ async def _extract_dag_workers(
                 if start_h == 7 and start_m == 0:
                     morning.setdefault(date_str, []).append(name)
 
-    logger.info("Kväll ~21: %d dagar, Morgon ~07: %d dagar", len(evening), len(morning))
-    return evening, morning
+    logger.info("Kväll: %d, Morgon: %d, Ka: %d dagar", len(evening), len(morning), len(kan_arbeta))
+    return evening, morning, kan_arbeta
 
 
 def _save_shifts(shifts: list[dict]):
