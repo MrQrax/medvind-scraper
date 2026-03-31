@@ -157,11 +157,17 @@ async def _scrape_coworkers(page: Page) -> tuple[dict[str, list[dict]], set[str]
             if (t.match(/(\\d{1,2})\\/(\\d{1,2})/)) headers.push(t);
         }
 
+        function parseName(raw) {
+            const lines = raw.split('\\n').map(l => l.trim()).filter(l => l);
+            const person = lines.filter(l => !l.match(/Avdelningar/));
+            return person.length > 0 ? person[person.length - 1] : '';
+        }
+
         const rows = [];
         const count = Math.min(nameTbls.length, shiftTbls.length);
         for (let i = 0; i < count; i++) {
-            const name = nameTbls[i].innerText.trim();
-            if (!name || name.match(/^\\d+\\s+Avdelningar/)) continue;
+            const name = parseName(nameTbls[i].innerText.trim());
+            if (!name) continue;
 
             const cells = shiftTbls[i].querySelectorAll('td');
             const cellData = [];
@@ -369,6 +375,7 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
                 "covering": [],
                 "absent": [],
                 "kan_arbeta": [],
+                "sjuka": [],
                 "rapport_from": [],
                 "rapport_to": [],
                 "raw_text": f"{header} {time_text} {shift_type}".strip(),
@@ -415,25 +422,46 @@ async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
             if isinstance(keywords, str):
                 keywords = [keywords]
 
+            # Om flera avdelningar (Kanin + Kia), tagga med avdelningsnamn
+            tag_dept = len(keywords) > 1
+
             for keyword in keywords:
-                evening_map, morning_map, ka_map = await _select_dept_and_extract(page, keyword)
+                evening_map, morning_map, ka_map, sjuka_map = (
+                    await _select_dept_and_extract(page, keyword)
+                )
+
+                # Kort avdelningsnamn för taggning
+                dept_label = keyword.split(",")[0].strip() if tag_dept else ""
 
                 for shift in shifts:
                     if shift.get("location") != location:
                         continue
 
+                    morning_date = next_day_map[shift["date"]]
+
                     # Kväll: slutar 21:00 samma dag
                     new_from = evening_map.get(shift["date"], [])
+                    if dept_label and new_from:
+                        new_from = [f"{n} ({dept_label})" for n in new_from]
                     shift["rapport_from"] = shift.get("rapport_from", []) + new_from
 
                     # Morgon: börjar 07:00 dagen efter
-                    morning_date = next_day_map[shift["date"]]
                     new_to = morning_map.get(morning_date, [])
+                    if dept_label and new_to:
+                        new_to = [f"{n} ({dept_label})" for n in new_to]
                     shift["rapport_to"] = shift.get("rapport_to", []) + new_to
 
-                    # Kan arbeta på avdelningen samma dag
+                    # Kan arbeta
                     new_ka = ka_map.get(shift["date"], [])
                     shift["kan_arbeta"] = shift.get("kan_arbeta", []) + new_ka
+
+                    # Sjuka — kväll (samma dag) + morgon (nästa dag)
+                    sjuka_kväll = sjuka_map.get(shift["date"], [])
+                    sjuka_morgon = sjuka_map.get(morning_date, [])
+                    all_sjuka = list(set(sjuka_kväll + sjuka_morgon))
+                    if dept_label and all_sjuka:
+                        all_sjuka = [f"{n} ({dept_label})" for n in all_sjuka]
+                    shift["sjuka"] = shift.get("sjuka", []) + all_sjuka
 
         # Byt tillbaka till Natt-vyn
         await _select_dept_via_org(page, "Natt")
@@ -444,6 +472,7 @@ async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
     for shift in shifts:
         shift.setdefault("rapport_from", [])
         shift.setdefault("rapport_to", [])
+        shift.setdefault("sjuka", [])
 
 
 async def _select_dept_via_org(page: Page, keyword: str) -> bool:
@@ -502,21 +531,21 @@ async def _select_dept_via_org(page: Page, keyword: str) -> bool:
 
 async def _select_dept_and_extract(
     page: Page, keyword: str
-) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
-    """Välj avdelning och extrahera kväll-, morgon- och Ka-personal."""
+) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    """Välj avdelning och extrahera kväll-, morgon-, Ka- och sjukpersonal."""
     if not await _select_dept_via_org(page, keyword):
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
-    evening_map, morning_map, ka_map = await _extract_dag_workers(page)
-    logger.info("Rapport %s — kväll: %d, morgon: %d, ka: %d dagar",
-                keyword, len(evening_map), len(morning_map), len(ka_map))
-    return evening_map, morning_map, ka_map
+    evening_map, morning_map, ka_map, sjuka_map = await _extract_dag_workers(page)
+    logger.info("Rapport %s — kväll: %d, morgon: %d, ka: %d, sjuka: %d",
+                keyword, len(evening_map), len(morning_map), len(ka_map), len(sjuka_map))
+    return evening_map, morning_map, ka_map, sjuka_map
 
 
 async def _extract_dag_workers(
     page: Page,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Extrahera dagpersonal: slutar ~21:00 (kväll) och börjar ~07:00 (morgon)."""
+    """Extrahera dagpersonal: kväll 21, morgon 07, kan arbeta, sjuka."""
     year = datetime.now().year
     try:
         period_text = await page.locator("text=/\\d{4}-\\d{2}-\\d{2}/").first.inner_text(timeout=3000)
@@ -542,11 +571,17 @@ async def _extract_dag_workers(
             if (t.match(/(\\d{1,2})\\/(\\d{1,2})/)) headers.push(t);
         }
 
+        function parseName(raw) {
+            const lines = raw.split('\\n').map(l => l.trim()).filter(l => l);
+            const person = lines.filter(l => !l.match(/Avdelningar/));
+            return person.length > 0 ? person[person.length - 1] : '';
+        }
+
         const rows = [];
         const count = Math.min(nameTbls.length, shiftTbls.length);
         for (let i = 0; i < count; i++) {
-            const name = nameTbls[i].innerText.trim();
-            if (!name || name.match(/^\\d+\\s+Avdelningar/)) continue;
+            const name = parseName(nameTbls[i].innerText.trim());
+            if (!name) continue;
 
             const cells = shiftTbls[i].querySelectorAll('td');
             const cellData = [];
@@ -561,12 +596,13 @@ async def _extract_dag_workers(
 
     if not raw or not raw.get("rows"):
         logger.warning("Kunde inte extrahera dagpersonal")
-        return {}, {}
+        return {}, {}, {}, {}
 
     headers = raw["headers"]
-    evening: dict[str, list[str]] = {}   # Slutar 21:00
-    morning: dict[str, list[str]] = {}   # Börjar 07:00
+    evening: dict[str, list[str]] = {}     # Slutar 21:00
+    morning: dict[str, list[str]] = {}     # Börjar 07:00
     kan_arbeta: dict[str, list[str]] = {}  # Ka (kan jobba)
+    sjuka: dict[str, list[str]] = {}       # Fr/Sj (sjuk/frånvaro)
 
     for row in raw["rows"]:
         name = row["name"]
@@ -589,6 +625,11 @@ async def _extract_dag_workers(
                 kan_arbeta.setdefault(date_str, []).append(name)
                 continue
 
+            # Sjuk/Frånvaro (Fr, Sj, FL, Se, Tj)
+            if re.search(r"\d[:]\d{2}(Fr|Sj|FL|Se|Tj)", text):
+                sjuka.setdefault(date_str, []).append(name)
+                continue
+
             # Matcha alla tidsintervall i cellen
             for m in re.finditer(r'(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})', text):
                 start_h, start_m = int(m.group(1)), int(m.group(2))
@@ -602,8 +643,9 @@ async def _extract_dag_workers(
                 if start_h == 7 and start_m == 0:
                     morning.setdefault(date_str, []).append(name)
 
-    logger.info("Kväll: %d, Morgon: %d, Ka: %d dagar", len(evening), len(morning), len(kan_arbeta))
-    return evening, morning, kan_arbeta
+    logger.info("Kväll: %d, Morgon: %d, Ka: %d, Sjuka: %d dagar",
+                len(evening), len(morning), len(kan_arbeta), len(sjuka))
+    return evening, morning, kan_arbeta, sjuka
 
 
 def _save_shifts(shifts: list[dict]):
