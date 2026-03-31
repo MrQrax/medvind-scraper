@@ -79,9 +79,14 @@ async def scrape_shifts(page: Page) -> list[dict]:
             shift["location"] = "Rådmansholmen"
 
         people = coworker_map.get(shift["date"], [])
-        shift["coworkers"] = [
-            _format_person(p) for p in people if p["status"] == "working"
-        ]
+
+        # Tagga nattkollegor med avdelning
+        workers = [p for p in people if p["status"] == "working"]
+        for p in workers:
+            if not p["note"]:
+                p["note"] = "Rådmansholmen"
+
+        shift["coworkers"] = [_format_person(p) for p in workers]
         shift["covering"] = [
             _format_person(p) for p in people if p["status"] == "covering"
         ]
