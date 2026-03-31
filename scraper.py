@@ -36,7 +36,7 @@ ABSENT_TYPES = {"Fr", "FL", "Se", "Sj", "Tj"}
 
 # Annotations i celltext
 ANNOTATION_PATTERNS = {
-    "ckare": "Täckare",         # Täckare → hoppar in för någon
+    "ckare": "Täckare",         # Täckare → jobbar på Kaninholmen & Kiaholmen
     "Vak": "Vakant",            # Vakant pass
     "Annan v": "Annan våning",  # Jobbar på annan våning
     "te/APT": "Möte/APT",       # Arbetsplatsträff
@@ -68,20 +68,29 @@ async def scrape_shifts(page: Page) -> list[dict]:
         _save_shifts(shifts)
         return shifts
 
-    # Steg 2: Hämta kollegor med status från Översikt planering
-    coworker_map = await _scrape_coworkers(page)
-    if coworker_map:
-        for shift in shifts:
-            people = coworker_map.get(shift["date"], [])
-            shift["coworkers"] = [
-                _format_person(p) for p in people if p["status"] == "working"
-            ]
-            shift["covering"] = [
-                _format_person(p) for p in people if p["status"] == "covering"
-            ]
-            shift["absent"] = [
-                _format_person(p) for p in people if p["status"] == "absent"
-            ]
+    # Steg 2: Hämta kollegor + Täckare-dagar från Översikt planering
+    coworker_map, tackare_dates = await _scrape_coworkers(page)
+
+    for shift in shifts:
+        # Sätt location baserat på Översikt planering (pålitligare än kalender-vy)
+        if shift["date"] in tackare_dates:
+            shift["location"] = "Kaninholmen & Kiaholmen"
+        else:
+            shift["location"] = "Rådmansholmen"
+
+        people = coworker_map.get(shift["date"], [])
+        shift["coworkers"] = [
+            _format_person(p) for p in people if p["status"] == "working"
+        ]
+        shift["covering"] = [
+            _format_person(p) for p in people if p["status"] == "covering"
+        ]
+        shift["absent"] = [
+            _format_person(p) for p in people if p["status"] == "absent"
+        ]
+
+    # Steg 3: Hämta dagpersonal som slutar ~21 för rapport
+    await _scrape_rapport(page, shifts)
 
     _save_shifts(shifts)
     return shifts
@@ -94,10 +103,12 @@ def _format_person(p: dict) -> str:
     return p["name"]
 
 
-async def _scrape_coworkers(page: Page) -> dict[str, list[dict]]:
+async def _scrape_coworkers(page: Page) -> tuple[dict[str, list[dict]], set[str]]:
     """Navigera till Översikt planering och hämta teamets status per dag.
 
-    Returnerar {datum_str: [{name, status, note}, ...]} exklusive Jonny Nilsen.
+    Returnerar (coworker_map, tackare_dates) där:
+    - coworker_map = {datum_str: [{name, status, note}, ...]} exklusive Jonny Nilsen
+    - tackare_dates = set av datum-strängar där Jonny är Täckare
     """
     try:
         med = page.locator('.x-toolbar >> text=Medarbetare').first
@@ -115,7 +126,7 @@ async def _scrape_coworkers(page: Page) -> dict[str, list[dict]]:
 
     except Exception as e:
         logger.error("Kunde inte navigera till Översikt planering: %s", e)
-        return {}
+        return {}, set()
 
     year = datetime.now().year
     try:
@@ -172,18 +183,18 @@ async def _scrape_coworkers(page: Page) -> dict[str, list[dict]]:
 
     if not raw or not raw.get("rows"):
         logger.warning("Kunde inte extrahera kollegor")
-        return {}
+        return {}, set()
 
     headers = raw["headers"]
     rows = raw["rows"]
     logger.info("Översikt: %d kollegor, %d dagar", len(rows), len(headers))
 
     coworker_map: dict[str, list[dict]] = {}
+    tackare_dates: set[str] = set()
 
     for row in rows:
         name = row["name"]
-        if "jonny" in name.lower() and "nilsen" in name.lower():
-            continue
+        is_self = "jonny" in name.lower() and "nilsen" in name.lower()
 
         for col_idx, cell in enumerate(row["cells"]):
             if col_idx >= len(headers):
@@ -200,6 +211,11 @@ async def _scrape_coworkers(page: Page) -> dict[str, list[dict]]:
             if not date_str:
                 continue
 
+            if is_self:
+                if "ckare" in text:
+                    tackare_dates.add(date_str)
+                continue
+
             status, note = _classify_cell(text, colors)
 
             coworker_map.setdefault(date_str, []).append({
@@ -208,7 +224,8 @@ async def _scrape_coworkers(page: Page) -> dict[str, list[dict]]:
                 "note": note,
             })
 
-    return coworker_map
+    logger.info("Täckare-dagar: %s", sorted(tackare_dates))
+    return coworker_map, tackare_dates
 
 
 def _classify_cell(text: str, colors: set[str]) -> tuple[str, str]:
@@ -236,12 +253,15 @@ def _classify_cell(text: str, colors: set[str]) -> tuple[str, str]:
         reason = TYPE_DESCRIPTIONS.get(type_code, "Frånvarande")
         return "absent", reason
 
-    # 3. Extratid / hoppar in: rosa/magenta färg ELLER "Täckare"-annotation
-    if has_extra_color or annotation == "Täckare":
-        note = annotation if annotation else "Extratid"
-        return "covering", note
+    # 3. Extratid: rosa/magenta färg (utan Täckare-annotation)
+    if has_extra_color and annotation != "Täckare":
+        return "covering", "Extratid"
 
-    # 4. Allt annat = jobbar normalt
+    # 4. Täckare = jobbar på Kaninholmen & Kiaholmen
+    if annotation == "Täckare":
+        return "working", "Kaninholmen & Kiaholmen"
+
+    # 5. Allt annat = jobbar normalt (Rådmansholmen)
     note = annotation if annotation else ""
     return "working", note
 
@@ -337,10 +357,11 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
                 "end_time": end_time,
                 "shift_type": shift_type,
                 "shift_description": type_desc,
-                "location": "",
+                "location": "",  # Sätts i steg 2 via Översikt planering
                 "coworkers": [],
                 "covering": [],
                 "absent": [],
+                "rapport_from": [],
                 "raw_text": f"{header} {time_text} {shift_type}".strip(),
                 "scraped_at": datetime.now().isoformat(),
             })
@@ -351,6 +372,197 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
 
     logger.info("Extraherade %d pass", len(shifts))
     return shifts
+
+
+# ── Rapport-scraping (dagpersonal som slutar ~21:00) ─────────────────
+
+async def _scrape_rapport(page: Page, shifts: list[dict]) -> None:
+    """Hämta dagpersonal som slutar ~21:00 för rapport/överlämning.
+
+    Navigerar via Välj organisation till rätt avdelning (dag-vy)
+    och hittar vem som slutar runt 21:00 de dagar användaren jobbar natt.
+    """
+    # Avdelnings-sökord → trädnod-text i Medvind
+    DEPT_KEYWORDS = {
+        "Rådmansholmen": "dmansholmen",
+        "Kaninholmen & Kiaholmen": ["Kaninholmen", "Kiaholmen"],
+    }
+
+    locations_needed = set()
+    for shift in shifts:
+        locations_needed.add(shift.get("location", "Rådmansholmen"))
+
+    try:
+        for location in locations_needed:
+            keywords = DEPT_KEYWORDS.get(location, "dmansholmen")
+            if isinstance(keywords, str):
+                keywords = [keywords]
+
+            for keyword in keywords:
+                rapport_map = await _select_dept_and_extract(page, keyword)
+                if rapport_map:
+                    for shift in shifts:
+                        if shift.get("location") == location:
+                            existing = shift.get("rapport_from", [])
+                            new = rapport_map.get(shift["date"], [])
+                            shift["rapport_from"] = existing + new
+
+        # Byt tillbaka till Natt-vyn
+        await _select_dept_via_org(page, "Natt")
+
+    except Exception as e:
+        logger.error("Kunde inte hämta rapport-info: %s", e, exc_info=True)
+
+    for shift in shifts:
+        shift.setdefault("rapport_from", [])
+
+
+async def _select_dept_via_org(page: Page, keyword: str) -> bool:
+    """Öppna Välj organisation, expandera trädet, och välj en avdelning."""
+    try:
+        # Klicka dropdown-knappen (texten ändras beroende på aktuell vy)
+        dept_btn = page.locator(
+            'a.x-btn.x-btn-mv-button-large.x-badge'
+        ).first
+        await dept_btn.click()
+        await human_delay(1000, 2000)
+
+        # Välj organisation
+        await page.wait_for_selector('.x-menu-item:visible', timeout=5000)
+        org_item = page.locator(
+            '.x-menu-item:has-text("lj organisation"):visible'
+        ).first
+        await org_item.click()
+        await human_delay(3000, 5000)
+
+        # Expandera rotnoden (Äldreomsorg...)
+        expanders = page.locator('.x-tree-expander')
+        await expanders.first.click()
+        await human_delay(1000, 2000)
+
+        # Expandera 8521 Avdelningar
+        avd_count = await expanders.count()
+        if avd_count > 1:
+            await expanders.nth(1).click()
+            await human_delay(1000, 2000)
+
+        # Klicka på rätt avdelning
+        target = page.locator(f'.x-tree-node-text:has-text("{keyword}")').first
+        await target.click()
+        await human_delay(500, 1000)
+
+        # Klicka Välj-knappen
+        valj_btn = page.locator('.x-window a.x-btn:has-text("lj")').first
+        await valj_btn.click()
+        await human_delay(3000, 5000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        await human_delay(1000, 2000)
+
+        return True
+
+    except Exception as e:
+        logger.error("Kunde inte välja avdelning '%s': %s", keyword, e)
+        # Stäng eventuell öppen dialog
+        try:
+            await page.locator('.x-window a.x-btn:has-text("ng")').first.click()
+            await human_delay(500, 1000)
+        except Exception:
+            pass
+        return False
+
+
+async def _select_dept_and_extract(page: Page, keyword: str) -> dict[str, list[str]]:
+    """Välj avdelning via organisation och extrahera dagpersonal som slutar ~21."""
+    if not await _select_dept_via_org(page, keyword):
+        return {}
+
+    rapport_map = await _extract_dag_workers(page)
+    logger.info("Rapport %s: %s", keyword, rapport_map)
+    return rapport_map
+
+
+async def _extract_dag_workers(page: Page) -> dict[str, list[str]]:
+    """Extrahera dagpersonal som slutar runt 21:00 från aktuell Översikt-vy."""
+    year = datetime.now().year
+    try:
+        period_text = await page.locator("text=/\\d{4}-\\d{2}-\\d{2}/").first.inner_text(timeout=3000)
+        year_match = re.search(r"(\d{4})", period_text)
+        if year_match:
+            year = int(year_match.group(1))
+    except Exception:
+        pass
+
+    raw = await page.evaluate("""() => {
+        const views = document.querySelectorAll('.x-grid-view');
+        if (views.length < 2) return null;
+
+        const nameView = views[0];
+        const shiftView = views[1];
+        const nameTbls = nameView.querySelectorAll('table');
+        const shiftTbls = shiftView.querySelectorAll('table');
+
+        const headerEls = document.querySelectorAll('.x-column-header-text');
+        const headers = [];
+        for (const h of headerEls) {
+            const t = h.innerText.trim();
+            if (t.match(/(\\d{1,2})\\/(\\d{1,2})/)) headers.push(t);
+        }
+
+        const rows = [];
+        const count = Math.min(nameTbls.length, shiftTbls.length);
+        for (let i = 0; i < count; i++) {
+            const name = nameTbls[i].innerText.trim();
+            if (!name || name.match(/^\\d+\\s+Avdelningar/)) continue;
+
+            const cells = shiftTbls[i].querySelectorAll('td');
+            const cellData = [];
+            for (const c of cells) {
+                cellData.push(c.innerText.trim());
+            }
+            rows.push({name, cells: cellData});
+        }
+
+        return {headers, rows};
+    }""")
+
+    if not raw or not raw.get("rows"):
+        logger.warning("Kunde inte extrahera dagpersonal")
+        return {}
+
+    headers = raw["headers"]
+    result: dict[str, list[str]] = {}
+
+    for row in raw["rows"]:
+        name = row["name"]
+        if "jonny" in name.lower() and "nilsen" in name.lower():
+            continue
+
+        for col_idx, text in enumerate(row["cells"]):
+            if col_idx >= len(headers):
+                break
+
+            if not text or text == "Ledig":
+                continue
+
+            # Hitta sluttid — matcha "HH:MM-HH:MM" och kolla sluttiden
+            end_match = re.search(r'\d{1,2}:\d{2}\s*[-–]\s*(\d{1,2}):(\d{2})', text)
+            if not end_match:
+                continue
+
+            end_hour = int(end_match.group(1))
+            end_min = int(end_match.group(2))
+
+            # Acceptera pass som slutar 20:30–21:30
+            total_min = end_hour * 60 + end_min
+            if not (20 * 60 + 30 <= total_min <= 21 * 60 + 30):
+                continue
+
+            date_str = _header_to_date(headers[col_idx], year)
+            if date_str:
+                result.setdefault(date_str, []).append(name)
+
+    logger.info("Dagpersonal som slutar ~21: %d dagar", len(result))
+    return result
 
 
 def _save_shifts(shifts: list[dict]):
