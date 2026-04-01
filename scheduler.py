@@ -1,23 +1,27 @@
 import asyncio
 import random
 import logging
+import time
 from datetime import datetime
 
 import schedule
 
-from config import CHECK_INTERVAL_HOURS
 from browser import create_stealth_browser
 from auth import ensure_authenticated
 from scraper import scrape_shifts
 from notifier import check_and_notify
 from klarmarkera import klarmarkera_week
+from settings import load_settings
 
 logger = logging.getLogger("medvind.scheduler")
 
+_last_full_scrape: float = 0.0
 
-async def run_check_cycle():
-    """Kör en komplett check: logga in, hämta schema, detektera ändringar, notifiera."""
-    logger.info("Startar schema-check...")
+
+async def run_full_scrape():
+    """Full scrape: kalender + kollegor + rapport + korsvalidering."""
+    global _last_full_scrape
+    logger.info("=== FULL SCRAPE ===")
 
     try:
         async with create_stealth_browser(headless=True) as (browser, context, page):
@@ -31,12 +35,10 @@ async def run_check_cycle():
                 return
 
             logger.info("Hittade %d pass", len(shifts))
-
-            # Ändringsdetektering + påminnelser
             check_and_notify(shifts)
 
-            # Klarmarkera automatiskt på söndagar
-            if datetime.now().isoweekday() == 7:
+            settings = load_settings()
+            if settings.get("auto_klarmarkera") and datetime.now().isoweekday() == 7:
                 logger.info("Söndag — kör automatisk klarmarkering")
                 try:
                     await page.locator('a:has-text("Kalender")').first.click()
@@ -46,41 +48,78 @@ async def run_check_cycle():
                 await klarmarkera_week(page)
 
     except Exception as e:
-        logger.error("Schema-check misslyckades: %s", e, exc_info=True)
+        logger.error("Full scrape misslyckades: %s", e, exc_info=True)
 
-    logger.info("Schema-check klar")
+    _last_full_scrape = time.time()
+    logger.info("Full scrape klar")
 
 
-async def _run_check_with_jitter_async():
-    jitter = random.randint(-5, 5) * 60  # ±5 min
+async def run_quick_check():
+    """Quick check: logga in, kolla Översikt planering, jämför med sparad data."""
+    settings = load_settings()
+    scrape_interval = settings["scrape_interval_hours"] * 3600
+
+    # Om det är dags för full scrape, kör den istället
+    if time.time() - _last_full_scrape >= scrape_interval:
+        await run_full_scrape()
+        return
+
+    logger.info("--- Quick check ---")
+    try:
+        async with create_stealth_browser(headless=True) as (browser, context, page):
+            if not await ensure_authenticated(page, context):
+                logger.error("Inloggning misslyckades")
+                return
+
+            shifts = await scrape_shifts(page)
+            if not shifts:
+                logger.warning("Inga pass hittades vid quick check")
+                return
+
+            logger.info("Quick check: %d pass verifierade", len(shifts))
+            check_and_notify(shifts)
+
+    except Exception as e:
+        logger.error("Quick check misslyckades: %s", e, exc_info=True)
+
+    logger.info("Quick check klar")
+
+
+async def _run_with_jitter_async(task):
+    jitter = random.randint(-5, 5) * 60
     if jitter > 0:
         await asyncio.sleep(jitter)
-    await run_check_cycle()
+    await task()
 
 
-def _run_check_with_jitter():
-    asyncio.run(_run_check_with_jitter_async())
+def _run_quick_check():
+    asyncio.run(_run_with_jitter_async(run_quick_check))
 
 
 def start_scheduler():
-    """Starta schemaläggaren: check varje timme + klarmarkering söndag 21:00."""
-    logger.info("Kör initial schema-check...")
-    asyncio.run(run_check_cycle())
+    """Starta schemaläggaren med inställningar från settings.json."""
+    settings = load_settings()
+    check_minutes = settings["check_interval_minutes"]
 
-    # Schema varje timme
-    schedule.every(CHECK_INTERVAL_HOURS).hours.do(_run_check_with_jitter)
+    logger.info("Kör initial full scrape...")
+    asyncio.run(run_full_scrape())
 
-    # Klarmarkera söndag kväll kl 21:00
-    schedule.every().sunday.at("21:00").do(
-        lambda: asyncio.run(run_klarmarkera())
-    )
+    # Quick check varje X minuter (inkl. auto-full-scrape vid behov)
+    schedule.every(check_minutes).minutes.do(_run_quick_check)
+
+    # Klarmarkering
+    if settings.get("auto_klarmarkera"):
+        day = settings.get("klarmarkera_day", "sunday")
+        t = settings.get("klarmarkera_time", "21:00")
+        getattr(schedule.every(), day).at(t).do(
+            lambda: asyncio.run(run_klarmarkera())
+        )
 
     logger.info(
-        "Schemaläggare startad: check varje %dh, klarmarkering söndag 21:00",
-        CHECK_INTERVAL_HOURS,
+        "Schemaläggare startad: check var %d min, full scrape var %dh",
+        check_minutes, settings["scrape_interval_hours"],
     )
 
-    import time
     while True:
         schedule.run_pending()
         time.sleep(60)

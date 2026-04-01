@@ -1,11 +1,12 @@
 import json
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from playwright.async_api import Page
 
 from config import SHIFTS_FILE
+from settings import load_settings
 from browser import human_delay, random_mouse_wander
 
 logger = logging.getLogger("medvind.scraper")
@@ -100,8 +101,49 @@ async def scrape_shifts(page: Page) -> list[dict]:
     # Steg 3: Hämta dagpersonal som slutar ~21 för rapport
     await _scrape_rapport(page, shifts)
 
+    # Steg 4: Korsvalidera — om en person är frånvarande/sjuk på majoriteten
+    # av datumen, ska den inte stå som kollega på resterande datum
+    _cross_validate_absent(shifts)
+
     _save_shifts(shifts)
     return shifts
+
+
+def _cross_validate_absent(shifts: list[dict]) -> None:
+    """Korsvalidera frånvaro mot kollegor-listor.
+
+    - 100 % frånvaro (aldrig i coworkers) → inget att fixa
+    - Blandat (borta på fler datum än de jobbar) → logga varning så det
+      syns tydligt vid körning. Auto-fix görs ej här eftersom personen
+      kan jobba enstaka datum trots långvarig sjukskrivning.
+    """
+    from collections import defaultdict
+
+    def _extract_name(entry: str) -> str:
+        return re.sub(r"\s*\(.*?\)\s*$", "", entry).strip()
+
+    person_working: dict[str, list[str]] = defaultdict(list)
+    person_absent: dict[str, list[str]] = defaultdict(list)
+
+    for shift in shifts:
+        d = shift["date"]
+        for entry in shift.get("coworkers", []):
+            person_working[_extract_name(entry)].append(d)
+        for entry in shift.get("absent", []) + shift.get("sjuka", []):
+            person_absent[_extract_name(entry)].append(d)
+
+    for name, absent_dates in person_absent.items():
+        working_dates = person_working.get(name, [])
+        if not working_dates:
+            continue  # 100 % frånvaro — inget att flagga
+
+        total = len(absent_dates) + len(working_dates)
+        if len(absent_dates) > len(working_dates):
+            logger.warning(
+                "⚠ KORSVALIDERING: %s är frånvarande %d av %d datum men "
+                "står som kollega %s — kontrollera manuellt!",
+                name, len(absent_dates), total, working_dates,
+            )
 
 
 def _format_person(p: dict) -> str:
@@ -390,6 +432,15 @@ async def _extract_medvind_calendar(page: Page) -> list[dict]:
         except Exception as e:
             logger.debug("Kunde inte parsa cell %d: %s", i, e)
             continue
+
+    # Filtrera bort pass som ligger för långt fram
+    settings = load_settings()
+    max_date = (datetime.now() + timedelta(days=settings["look_ahead_days"])).strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    before = len(shifts)
+    shifts = [s for s in shifts if today <= s["date"] <= max_date]
+    if len(shifts) < before:
+        logger.info("Filtrerade bort %d pass utanför intervallet (idag – %s)", before - len(shifts), max_date)
 
     logger.info("Extraherade %d pass", len(shifts))
     return shifts
